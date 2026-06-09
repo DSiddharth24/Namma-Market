@@ -1,13 +1,22 @@
 """
 Namma Market AI Agent — powered by Google Gemini (FREE tier)
 
-Key fixes:
-- Active flow ALWAYS takes priority over intent detection
-- Main menu numbers (1-5) handled before anything else
-- "loan" keyword takes priority over "scheme"
-- Scheme info displayed directly (not via GPT) when scheme name typed
-- Crop names in context of eligibility/scheme don't trigger fertilizer flow
-- GPT only fires for truly unrecognised messages
+CRITICAL ARCHITECTURE:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. Menu numbers (1-5) → FIRST, always
+2. Active flow → SECOND, ALWAYS takes priority over intent detection
+3. Greeting/restart → THIRD (but NOT on menu numbers or crops)
+4. Intent detection → ONLY if NO active flow
+5. Gemini fallback → Last resort for unrecognized messages
+
+KEY FIXES:
+──────────
+✅ Menu numbers always work (checked before intent)
+✅ Active flows prevent re-detection (stay in flow until complete)
+✅ "loan" keyword beats "scheme" (checked first in intent detection)
+✅ Scheme names (PM-KISAN, Raita Siri, etc.) trigger direct scheme info
+✅ Crop names in eligibility context stay in flow (not diverted to fertilizer)
+✅ GPT only used for genuinely unrecognized messages
 """
 
 import os
@@ -21,9 +30,10 @@ from data.schemes import SCHEMES, BANK_LOANS
 from data.fertilizer_shops import FERTILIZER_SHOPS, CROP_ADVICE
 import random
 
-# ─────────────────────────────────────────────
-# Gemini client — lazy init
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
+# GEMINI CLIENT — LAZY INIT
+# ═════════════════════════════════════════════════════════════════
+
 _gemini_client = None
 
 def _get_client():
@@ -55,129 +65,219 @@ Rules:
 Format: *bold* for important words, emojis, short bullet points."""
 
 
-# ─────────────────────────────────────────────
-# MAIN HANDLER — flow takes priority over intent
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
+# MAIN MESSAGE HANDLER — STRICT PRIORITY ORDER
+# ═════════════════════════════════════════════════════════════════
 
 def handle_message(phone: str, message: str) -> str:
+    """
+    Main entry point. Follows STRICT priority:
+    1. Menu numbers (1-5)
+    2. Active flows (ALWAYS take priority)
+    3. Greeting/restart
+    4. Intent detection
+    5. Gemini fallback
+    """
     session = get_session(phone)
     msg = message.strip()
     msg_lower = msg.lower()
     current_flow = session.get("current_flow")
 
-    # ── 1. ACTIVE FLOWS always win — don't re-detect intent ──────────────
-    if current_flow == "apmc_followup":
-        return _handle_apmc_followup(phone, msg, session)
+    # ──────────────────────────────────────────────────────────────
+    # PRIORITY 1: MENU NUMBERS (1-5) — Always work
+    # ──────────────────────────────────────────────────────────────
+    if msg in ("1", "2", "3", "4", "5"):
+        # If there's an active flow, handle it first (could be sub-menu)
+        if current_flow:
+            return _handle_active_flow(phone, msg, session, current_flow)
+        
+        # Otherwise, route to menu intent
+        menu_map = {"1": "apmc", "2": "scheme", "3": "eligibility", "4": "loan", "5": "fertilizer"}
+        return _route_intent(phone, msg, session, menu_map[msg])
 
-    if current_flow == "scheme_eligibility_flow":
-        return _handle_eligibility_flow(phone, msg, session)
+    # ──────────────────────────────────────────────────────────────
+    # PRIORITY 2: ACTIVE FLOWS — ALWAYS take priority
+    # ──────────────────────────────────────────────────────────────
+    if current_flow:
+        return _handle_active_flow(phone, msg, session, current_flow)
 
-    if current_flow == "fertilizer_flow":
-        return _handle_fertilizer_flow(phone, msg, session)
-
-    if current_flow == "loan_flow":
-        return _handle_loan_flow(phone, msg, session)
-
-    if current_flow == "scheme_info_flow":
-        return _handle_scheme_info_flow(phone, msg, session)
-
-    # ── 2. MAIN MENU numbers (1–5) ────────────────────────────────────────
-    if msg.strip() in ("1", "2", "3", "4", "5"):
-        menu_map = {
-            "1": "apmc",
-            "2": "scheme",
-            "3": "eligibility",
-            "4": "loan",
-            "5": "fertilizer",
-        }
-        return _route_intent(phone, msg, session, menu_map[msg.strip()])
-
-    # ── 3. GREETINGS / restart ────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────────
+    # PRIORITY 3: GREETING / RESTART
+    # ──────────────────────────────────────────────────────────────
     greeting_words = ["hi", "hello", "start", "ನಮಸ್ಕಾರ", "namaskara", "hey",
-                      "namma market", "menu", "help", "ಸಹಾಯ"]
-    if any(msg_lower == g or msg_lower.startswith(g + " ") for g in greeting_words) \
-            or (len(msg_lower) <= 4 and msg_lower not in CROP_ALIASES):
+                      "namma market", "menu", "help", "ಸಹಾಯ", "restart"]
+    
+    # Check if message matches a greeting word
+    is_greeting = any(
+        msg_lower == g or msg_lower.startswith(g + " ")
+        for g in greeting_words
+    )
+    
+    # Also treat very short unknown messages as greetings (but NOT crop names or numbers)
+    if not is_greeting and len(msg_lower) <= 4:
+        # If it's not a known crop or a number, treat as greeting
+        if msg_lower not in CROP_ALIASES and msg not in ("1", "2", "3", "4", "5"):
+            is_greeting = True
+    
+    if is_greeting:
         clear_session(phone)
         return _greeting_message()
 
-    # ── 4. DETECT INTENT (only if no active flow) ─────────────────────────
-    intent = _detect_intent(msg_lower)
+    # ──────────────────────────────────────────────────────────────
+    # PRIORITY 4: INTENT DETECTION (only if NO active flow)
+    # ──────────────────────────────────────────────────────────────
+    intent = _detect_intent(msg_lower, message)
     return _route_intent(phone, msg, session, intent)
 
 
+# ═════════════════════════════════════════════════════════════════
+# ACTIVE FLOW HANDLER — Routes to correct flow handler
+# ═════════════════════════════════════════════════════════════════
+
+def _handle_active_flow(phone: str, msg: str, session: dict, current_flow: str) -> str:
+    """Route to the correct flow handler based on current_flow."""
+    if current_flow == "apmc_followup":
+        return _handle_apmc_followup(phone, msg, session)
+    elif current_flow == "scheme_eligibility_flow":
+        return _handle_eligibility_flow(phone, msg, session)
+    elif current_flow == "scheme_info_flow":
+        return _handle_scheme_info_flow(phone, msg, session)
+    elif current_flow == "fertilizer_flow":
+        return _handle_fertilizer_flow(phone, msg, session)
+    elif current_flow == "loan_flow":
+        return _handle_loan_flow(phone, msg, session)
+    else:
+        clear_session(phone)
+        return _greeting_message()
+
+
+# ═════════════════════════════════════════════════════════════════
+# INTENT DETECTION — Keyword-based routing
+# ═════════════════════════════════════════════════════════════════
+
+def _detect_intent(msg_lower: str, original_msg: str = "") -> str:
+    """
+    Detect intent from keywords. Priority order matters!
+    
+    IMPORTANT: "loan" must be checked BEFORE "scheme"
+    because "loan scheme" should go to loan, not scheme.
+    """
+    
+    # ──────────────────────────────────────────────────────────────
+    # 1. LOAN KEYWORDS (must check before scheme)
+    # ──────────────────────────────────────────────────────────────
+    loan_keywords = ["loan", "ಸಾಲ", "kcc", "credit card", "borrow",
+                     "farm loan", "crop loan", "term loan", "finance", "credit"]
+    if any(k in msg_lower for k in loan_keywords):
+        return "loan"
+
+    # ──────────────────────────────────────────────────────────────
+    # 2. SPECIFIC SCHEME NAMES (direct to scheme info, not scheme menu)
+    # ──────────────────────────────────────────────────────────────
+    scheme_name_keywords = {
+        "pm kisan": "pm_kisan",
+        "pmkisan": "pm_kisan",
+        "pm-kisan": "pm_kisan",
+        "kisan samman": "pm_kisan",
+        "6000": "pm_kisan",
+        "pmfby": "pmfby",
+        "fasal bima": "pmfby",
+        "crop insurance": "pmfby",
+        "kcc": "kcc",  # But will be caught by loan above
+        "kisan credit": "kcc",
+        "raita siri": "karnataka_raita_siri",
+        "ರೈತ ಸಿರಿ": "karnataka_raita_siri",
+        "raitha siri": "karnataka_raita_siri",
+        "soil health": "soil_health_card",
+        "soil card": "soil_health_card",
+        "ಮಣ್ಣು ಆರೋಗ್ಯ": "soil_health_card",
+        "drip": "drip_sprinkler",
+        "sprinkler": "drip_sprinkler",
+        "ಹನಿ ನೀರಾವರಿ": "drip_sprinkler",
+    }
+    
+    for keyword, scheme_id in scheme_name_keywords.items():
+        if keyword in msg_lower or keyword in original_msg.lower():
+            if scheme_id and scheme_id != "kcc":  # KCC handled by loan keywords
+                return "scheme_direct"
+    
+    # ──────────────────────────────────────────────────────────────
+    # 3. APMC / MARKET RATES
+    # ──────────────────────────────────────────────────────────────
+    rate_keywords = ["rate", "price", "ದರ", "ಬೆಲೆ", "apmc", "mandi",
+                     "market rate", "today price", "ಇಂದಿನ ದರ", "ಮಾರ್ಕೆಟ್ ದರ"]
+    if any(k in msg_lower for k in rate_keywords):
+        return "apmc"
+
+    # ──────────────────────────────────────────────────────────────
+    # 4. ELIGIBILITY CHECK
+    # ──────────────────────────────────────────────────────────────
+    eligibility_keywords = ["eligible", "ಅರ್ಹ", "qualify", "eligibility",
+                            "check eligibility", "am i eligible"]
+    if any(k in msg_lower for k in eligibility_keywords):
+        return "eligibility"
+
+    # ──────────────────────────────────────────────────────────────
+    # 5. GENERAL SCHEME/GOVERNMENT KEYWORDS
+    # ──────────────────────────────────────────────────────────────
+    scheme_keywords = ["scheme", "ಯೋಜನೆ", "government", "ಸರ್ಕಾರ",
+                       "subsidy", "ಸಹಾಯಧನ", "yojana"]
+    if any(k in msg_lower for k in scheme_keywords):
+        return "scheme"
+
+    # ──────────────────────────────────────────────────────────────
+    # 6. FERTILIZER / CROP ADVICE — only explicit request
+    # ──────────────────────────────────────────────────────────────
+    fertilizer_explicit = ["fertilizer", "ಗೊಬ್ಬರ", "urea", "dap", "npk",
+                           "advice", "ಸಲಹೆ", "pest", "ಕೀಟ", "disease", "ರೋಗ",
+                           "irrigation", "ನೀರಾವರಿ", "varieties", "ತಳಿ",
+                           "crop advice", "farming advice", "ಕೃಷಿ ಸಲಹೆ",
+                           "spray", "pesticide"]
+    if any(k in msg_lower for k in fertilizer_explicit):
+        return "fertilizer"
+
+    # ──────────────────────────────────────────────────────────────
+    # 7. CROP NAME ALONE — ask what they need (not fertilizer)
+    # ──────────────────────────────────────────────────────────────
+    crop_only_keywords = ["sugarcane", "ಕಬ್ಬು", "paddy", "ಭತ್ತ", "ragi", "ರಾಗಿ",
+                          "tomato", "ಟೊಮೆಟೊ", "coconut", "ತೆಂಗಿನ", "banana", "ಬಾಳೆ",
+                          "onion", "ಈರುಳ್ಳಿ", "potato", "ಆಲೂ"]
+    if any(k in msg_lower for k in crop_only_keywords):
+        return "crop_clarify"
+
+    # ──────────────────────────────────────────────────────────────
+    # 8. FALLBACK — General message for Gemini
+    # ──────────────────────────────────────────────────────────────
+    return "general"
+
+
+# ═════════════════════════════════════════════════════════════════
+# INTENT ROUTER — Dispatches to flow starters
+# ═════════════════════════════════════════════════════════════════
+
 def _route_intent(phone: str, msg: str, session: dict, intent: str) -> str:
+    """Route detected intent to the appropriate flow."""
     if intent == "apmc":
         return _start_apmc_flow(phone, msg, session)
     elif intent == "scheme":
         return _start_scheme_flow(phone, msg, session)
+    elif intent == "scheme_direct":
+        return _handle_scheme_direct(phone, msg, session)
     elif intent == "eligibility":
         return _start_eligibility_selection(phone, msg, session)
     elif intent == "loan":
         return _start_loan_flow(phone, msg, session)
     elif intent == "fertilizer":
         return _start_fertilizer_flow(phone, msg, session)
-    else:
+    elif intent == "crop_clarify":
+        return _crop_clarify(phone, msg, session)
+    else:  # "general"
         return _call_gemini(phone, msg, session)
 
 
-# ─────────────────────────────────────────────
-# INTENT DETECTION — loan beats scheme, specific beats general
-# ─────────────────────────────────────────────
-
-def _detect_intent(msg: str) -> str:
-    # Loan FIRST — before scheme (since "loan scheme" should go to loan)
-    loan_keywords = ["loan", "ಸಾಲ", "kcc", "credit card", "borrow",
-                     "farm loan", "crop loan", "term loan", "finance"]
-    if any(k in msg for k in loan_keywords):
-        return "loan"
-
-    # APMC / market rates
-    rate_keywords = ["rate", "price", "ದರ", "ಬೆಲೆ", "apmc", "mandi",
-                     "market rate", "today price", "ಇಂದಿನ ದರ", "ಮಾರ್ಕೆಟ್ ದರ"]
-    if any(k in msg for k in rate_keywords):
-        return "apmc"
-
-    # Eligibility check
-    eligibility_keywords = ["eligible", "ಅರ್ಹ", "qualify", "eligibility",
-                            "check eligibility", "am i eligible"]
-    if any(k in msg for k in eligibility_keywords):
-        return "eligibility"
-
-    # Specific scheme names → scheme info flow
-    scheme_name_keywords = ["pm kisan", "pmkisan", "pmfby", "fasal bima",
-                            "raita siri", "ರೈತ ಸಿರಿ", "soil health",
-                            "ಮಣ್ಣು ಆರೋಗ್ಯ", "drip subsidy", "sprinkler subsidy",
-                            "crop insurance", "ಬೆಳೆ ವಿಮೆ"]
-    if any(k in msg for k in scheme_name_keywords):
-        return "scheme_direct"
-
-    # General scheme/government keywords
-    scheme_keywords = ["scheme", "ಯೋಜನೆ", "government", "ಸರ್ಕಾರ",
-                       "subsidy", "ಸಹಾಯಧನ", "yojana"]
-    if any(k in msg for k in scheme_keywords):
-        return "scheme"
-
-    # Fertilizer / crop advice — only when explicitly asked, NOT just crop name alone
-    fertilizer_explicit = ["fertilizer", "ಗೊಬ್ಬರ", "urea", "dap", "npk",
-                           "advice", "ಸಲಹೆ", "pest", "ಕೀಟ", "disease", "ರೋಗ",
-                           "irrigation", "ನೀರಾವರಿ", "varieties", "ತಳಿ",
-                           "crop advice", "farming advice", "ಕೃಷಿ ಸಲಹೆ"]
-    if any(k in msg for k in fertilizer_explicit):
-        return "fertilizer"
-
-    # Crop name alone (without advice keywords) → ask what they need
-    crop_only_keywords = ["sugarcane", "ಕಬ್ಬು", "paddy", "ಭತ್ತ", "ragi", "ರಾಗಿ",
-                          "tomato", "ಟೊಮೆಟೊ", "coconut", "ತೆಂಗಿನ", "banana", "ಬಾಳೆ",
-                          "onion", "ಈರುಳ್ಳಿ", "potato", "ಆಲೂ"]
-    if any(k in msg for k in crop_only_keywords):
-        return "crop_clarify"
-
-    return "general"
-
-
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
 # GREETING
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
 
 def _greeting_message() -> str:
     return (
@@ -195,28 +295,9 @@ def _greeting_message() -> str:
     )
 
 
-# ─────────────────────────────────────────────
-# CROP CLARIFY — crop name alone, ask what they need
-# ─────────────────────────────────────────────
-
-def _route_intent(phone: str, msg: str, session: dict, intent: str) -> str:
-    if intent == "apmc":
-        return _start_apmc_flow(phone, msg, session)
-    elif intent == "scheme":
-        return _start_scheme_flow(phone, msg, session)
-    elif intent == "scheme_direct":
-        return _handle_scheme_direct(phone, msg, session)
-    elif intent == "eligibility":
-        return _start_eligibility_selection(phone, msg, session)
-    elif intent == "loan":
-        return _start_loan_flow(phone, msg, session)
-    elif intent == "fertilizer":
-        return _start_fertilizer_flow(phone, msg, session)
-    elif intent == "crop_clarify":
-        return _crop_clarify(phone, msg, session)
-    else:
-        return _call_gemini(phone, msg, session)
-
+# ═════════════════════════════════════════════════════════════════
+# CROP CLARIFY — When crop name is typed alone
+# ═════════════════════════════════════════════════════════════════
 
 def _crop_clarify(phone: str, msg: str, session: dict) -> str:
     """Farmer typed just a crop name — ask what they need."""
@@ -230,14 +311,15 @@ def _crop_clarify(phone: str, msg: str, session: dict) -> str:
     )
 
 
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
 # APMC FLOW
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
 
 def _start_apmc_flow(phone: str, message: str, session: dict) -> str:
+    """Start APMC rates flow."""
     msg_lower = message.lower()
 
-    # Check if pending_crop exists from clarify step
+    # Check if pending_crop exists from crop clarify step
     pending = session.get("pending_crop", "")
     if message.strip() == "1" and pending:
         crop = pending
@@ -277,6 +359,7 @@ def _start_apmc_flow(phone: str, message: str, session: dict) -> str:
 
 
 def _handle_apmc_followup(phone: str, message: str, session: dict) -> str:
+    """Handle continuation of APMC rates flow."""
     msg = message.lower().strip()
 
     if msg in ("all", "ಎಲ್ಲ", "ಎಲ್ಲಾ"):
@@ -300,11 +383,12 @@ def _handle_apmc_followup(phone: str, message: str, session: dict) -> str:
     )
 
 
-# ─────────────────────────────────────────────
-# SCHEME FLOW — shows menu
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
+# SCHEME FLOW
+# ═════════════════════════════════════════════════════════════════
 
 def _start_scheme_flow(phone: str, message: str, session: dict) -> str:
+    """Start scheme selection flow."""
     update_session(phone, {"current_flow": "scheme_info_flow"})
     return (
         "🏛️ *ಸರ್ಕಾರಿ ಯೋಜನೆಗಳು | Government Schemes*\n"
@@ -322,14 +406,17 @@ def _start_scheme_flow(phone: str, message: str, session: dict) -> str:
 
 
 def _handle_scheme_info_flow(phone: str, message: str, session: dict) -> str:
-    """Handle scheme selection from the scheme menu."""
+    """Handle scheme selection menu."""
     msg = message.strip().lower()
     scheme_map = {
         "1": "pm_kisan", "2": "pmfby", "3": "kcc",
         "4": "karnataka_raita_siri", "5": "soil_health_card", "6": "drip_sprinkler",
     }
-    scheme_id = scheme_map.get(msg) or _detect_scheme_from_msg(message)
-
+    
+    scheme_id = scheme_map.get(msg)
+    if not scheme_id:
+        scheme_id = _detect_scheme_from_msg(message)
+    
     if not scheme_id:
         return (
             "ದಯವಿಟ್ಟು 1-6 ಸಂಖ್ಯೆ ಕಳಿಸಿ | Please send a number 1-6\n"
@@ -341,16 +428,18 @@ def _handle_scheme_info_flow(phone: str, message: str, session: dict) -> str:
 
 
 def _handle_scheme_direct(phone: str, message: str, session: dict) -> str:
-    """Farmer typed a scheme name directly — show info immediately."""
+    """Farmer typed a scheme name directly (e.g., 'raita siri', 'PM-KISAN')."""
     scheme_id = _detect_scheme_from_msg(message)
     if scheme_id:
         update_session(phone, {"current_flow": None})
         return _format_scheme_info(scheme_id)
+    # Fallback to scheme menu
     return _start_scheme_flow(phone, message, session)
 
 
 def _format_scheme_info(scheme_id: str) -> str:
-    scheme = SCHEMES.get(scheme_id)
+    """Format and return scheme information."""
+    scheme = SCHEMES.get(scheme_id) or BANK_LOANS.get(scheme_id)
     if not scheme:
         return "ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ | Information not available."
 
@@ -369,7 +458,11 @@ def _format_scheme_info(scheme_id: str) -> str:
         f"_{scheme.get('benefit_kn', '')}_\n\n"
     )
     if how_to:
-        msg += f"📋 *ಅರ್ಜಿ ವಿಧಾನ | How to Apply:*\n{how_to}\n\n"
+        msg += f"📋 *ಅರ್ಜಿ ವಿಧಾನ | How to Apply:*\n{how_to}\n"
+        if how_to_kn:
+            msg += f"_{how_to_kn}_\n\n"
+        else:
+            msg += "\n"
     if docs:
         msg += f"📄 *ದಾಖಲೆಗಳು | Documents:* {docs}\n\n"
     msg += f"📞 *ಸಂಪರ್ಕ | Contacts:*\n{contacts}\n\n"
@@ -380,11 +473,12 @@ def _format_scheme_info(scheme_id: str) -> str:
     return msg
 
 
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
 # ELIGIBILITY FLOW
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
 
 def _start_eligibility_selection(phone: str, message: str, session: dict) -> str:
+    """Start eligibility flow — scheme selection."""
     scheme_id = _detect_scheme_from_msg(message)
     if scheme_id:
         return _begin_eligibility_questions(phone, scheme_id)
@@ -409,6 +503,7 @@ def _start_eligibility_selection(phone: str, message: str, session: dict) -> str
 
 
 def _begin_eligibility_questions(phone: str, scheme_id: str) -> str:
+    """Start asking eligibility questions for a scheme."""
     scheme = SCHEMES.get(scheme_id) or BANK_LOANS.get(scheme_id)
     if not scheme:
         return "❌ Scheme not found. Type *menu* to start over."
@@ -441,6 +536,7 @@ def _begin_eligibility_questions(phone: str, scheme_id: str) -> str:
 
 
 def _handle_eligibility_flow(phone: str, message: str, session: dict) -> str:
+    """Handle eligibility flow continuation — NEVER diverted by keywords."""
     step = session.get("eligibility_step", "select_scheme")
 
     if step == "select_scheme":
@@ -449,12 +545,18 @@ def _handle_eligibility_flow(phone: str, message: str, session: dict) -> str:
             "4": "karnataka_raita_siri", "5": "soil_health_card",
             "6": "drip_sprinkler", "7": "crop_loan"
         }
-        scheme_id = scheme_map.get(message.strip()) or _detect_scheme_from_msg(message)
+        scheme_id = scheme_map.get(message.strip())
+        if not scheme_id:
+            scheme_id = _detect_scheme_from_msg(message)
         if not scheme_id:
             return "ದಯವಿಟ್ಟು 1-7 ಸಂಖ್ಯೆ ಕಳಿಸಿ | Please send a number 1-7"
         return _begin_eligibility_questions(phone, scheme_id)
 
     elif step == "questioning":
+        # ── KEY FIX: Keep answering eligibility questions ──
+        # Even if the answer contains a crop name like "sugarcane and 1 acre"
+        # we stay in eligibility flow and DON'T divert to fertilizer
+        
         scheme_id = session.get("scheme_id")
         scheme = SCHEMES.get(scheme_id) or BANK_LOANS.get(scheme_id)
         if not scheme:
@@ -500,11 +602,12 @@ def _handle_eligibility_flow(phone: str, message: str, session: dict) -> str:
     return _call_gemini(phone, message, session)
 
 
-# ─────────────────────────────────────────────
-# LOAN FLOW — shows loan menu with bank details
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
+# LOAN FLOW
+# ═════════════════════════════════════════════════════════════════
 
 def _start_loan_flow(phone: str, message: str, session: dict) -> str:
+    """Start loan information flow."""
     update_session(phone, {"current_flow": "loan_flow"})
     return (
         "🏦 *ಕೃಷಿ ಸಾಲ ಮಾಹಿತಿ | Farm Loan Information*\n"
@@ -524,6 +627,7 @@ def _start_loan_flow(phone: str, message: str, session: dict) -> str:
 
 
 def _handle_loan_flow(phone: str, message: str, session: dict) -> str:
+    """Handle loan flow continuation."""
     msg = message.strip().lower()
     loan_map = {"1": "kcc", "2": "agriculture_term_loan", "3": "crop_loan"}
     loan_id = loan_map.get(msg)
@@ -547,6 +651,7 @@ def _handle_loan_flow(phone: str, message: str, session: dict) -> str:
 
 
 def _format_loan_info(loan_id: str) -> str:
+    """Format and return loan information."""
     loan = BANK_LOANS.get(loan_id) or SCHEMES.get(loan_id)
     if not loan:
         return "Loan information not found. ಮಾಹಿತಿ ಲಭ್ಯವಿಲ್ಲ."
@@ -569,9 +674,16 @@ def _format_loan_info(loan_id: str) -> str:
     if loan.get("interest_rate"):
         msg += f"📊 *ಬಡ್ಡಿ ದರ | Interest Rate:* {loan['interest_rate']}\n\n"
     if how_to:
-        msg += f"📋 *ಅರ್ಜಿ ವಿಧಾನ | How to Apply:*\n{how_to}\n\n{how_to_kn}\n\n"
+        msg += f"📋 *ಅರ್ಜಿ ವಿಧಾನ | How to Apply:*\n{how_to}\n"
+        if how_to_kn:
+            msg += f"_{how_to_kn}_\n\n"
+        else:
+            msg += "\n"
     if docs:
-        msg += f"📄 *ದಾಖಲೆಗಳು | Documents:*\n{docs}\n{docs_kn}\n\n"
+        msg += f"📄 *ದಾಖಲೆಗಳು | Documents:*\n{docs}"
+        if docs_kn:
+            msg += f"\n{docs_kn}"
+        msg += "\n\n"
     msg += f"📞 *ಸಂಪರ್ಕ | Contacts:*\n{contacts}\n\n"
     msg += (
         "_ಅರ್ಹತೆ ಪರಿಶೀಲಿಸಲು 'eligibility' ಟೈಪ್ ಮಾಡಿ_\n"
@@ -580,14 +692,15 @@ def _format_loan_info(loan_id: str) -> str:
     return msg
 
 
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
 # FERTILIZER FLOW
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
 
 def _start_fertilizer_flow(phone: str, message: str, session: dict) -> str:
+    """Start fertilizer / crop advice flow."""
     msg_lower = message.lower()
 
-    # Check pending_crop from clarify step
+    # Check if pending_crop exists from crop clarify step
     pending = session.get("pending_crop", "")
     if message.strip() == "2" and pending:
         crop_key = _match_crop_key(pending)
@@ -597,7 +710,7 @@ def _start_fertilizer_flow(phone: str, message: str, session: dict) -> str:
 
     # Check if a specific crop is mentioned in message
     for key in CROP_ADVICE:
-        if key in msg_lower or CROP_ADVICE[key]["kannada"] in message:
+        if key in msg_lower or CROP_ADVICE[key].get("kannada", "") in message:
             update_session(phone, {"current_flow": None})
             return _give_crop_advice(key)
 
@@ -617,6 +730,7 @@ def _start_fertilizer_flow(phone: str, message: str, session: dict) -> str:
 
 
 def _handle_fertilizer_flow(phone: str, message: str, session: dict) -> str:
+    """Handle fertilizer flow continuation."""
     msg = message.lower().strip()
     crop_map = {
         "1": "sugarcane", "2": "paddy", "3": "ragi",
@@ -642,6 +756,7 @@ def _handle_fertilizer_flow(phone: str, message: str, session: dict) -> str:
 
 
 def _match_crop_key(text: str) -> str:
+    """Match crop key from text."""
     text = text.lower()
     for key in CROP_ADVICE:
         if key in text:
@@ -658,28 +773,29 @@ def _match_crop_key(text: str) -> str:
 
 
 def _give_crop_advice(crop_key: str) -> str:
+    """Give crop advice for a specific crop."""
     advice = CROP_ADVICE[crop_key]
     shop = random.choice(FERTILIZER_SHOPS)
 
     lines = [
-        f"🌿 *{crop_key.title()} ({advice['kannada']}) — ಕೃಷಿ ಸಲಹೆ | Farming Advice*\n",
-        f"🌱 *ತಳಿಗಳು | Varieties:*\n{', '.join(advice['varieties'])}\n",
-        f"📅 *ಋತು | Season:*\n{advice['season']}\n{advice['season_kn']}\n",
+        f"🌿 *{crop_key.title()} ({advice.get('kannada', '')}) — ಕೃಷಿ ಸಲಹೆ | Farming Advice*\n",
+        f"🌱 *ತಳಿಗಳು | Varieties:*\n{', '.join(advice.get('varieties', []))}\n",
+        f"📅 *ಋತು | Season:*\n{advice.get('season', '')}\n{advice.get('season_kn', '')}\n",
         "🧪 *ಗೊಬ್ಬರ | Fertilizer:*",
     ]
-    for stage, rec in advice["fertilizer"].items():
-        kn_rec = advice["fertilizer_kn"].get(stage, "")
+    for stage, rec in advice.get("fertilizer", {}).items():
+        kn_rec = advice.get("fertilizer_kn", {}).get(stage, "")
         lines.append(f"• {rec}")
         if kn_rec:
             lines.append(f"  _{kn_rec}_")
 
-    lines.append(f"\n💧 *ನೀರಾವರಿ | Irrigation:*\n{advice['water']}\n{advice['water_kn']}")
-    lines.append(f"\n🐛 *ರೋಗ/ಕೀಟ | Issues:*\n{advice['common_issues']}")
+    lines.append(f"\n💧 *ನೀರಾವರಿ | Irrigation:*\n{advice.get('water', '')}\n{advice.get('water_kn', '')}")
+    lines.append(f"\n🐛 *ರೋಗ/ಕೀಟ | Issues:*\n{advice.get('common_issues', '')}")
     lines.append(
         f"\n🛒 *ಹತ್ತಿರದ ಅಂಗಡಿ | Nearby Shop:*\n"
-        f"📍 *{shop['name']}*, {shop['location']}\n"
-        f"📞 *{shop['contact']}*\n"
-        f"Products: {', '.join(shop['products'][:3])}"
+        f"📍 *{shop['name']}*, {shop.get('location', '')}\n"
+        f"📞 *{shop.get('contact', '')}*\n"
+        f"Products: {', '.join(shop.get('products', [])[:3])}"
     )
     lines.append(
         f"\n\n❓ ನಿಮ್ಮ ಬೆಳೆ ಈಗ ಯಾವ ಹಂತದಲ್ಲಿದೆ?\n"
@@ -690,18 +806,23 @@ def _give_crop_advice(crop_key: str) -> str:
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────
-# GEMINI FALLBACK
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
+# GEMINI FALLBACK — for unrecognized messages
+# ═════════════════════════════════════════════════════════════════
 
 def _call_gemini(phone: str, message: str, session: dict) -> str:
+    """Call Gemini for general farming questions."""
     history = session.get("gemini_history", [])
     contents = []
+    
+    # Build conversation history
     for turn in history[-16:]:
         contents.append(types.Content(
             role=turn["role"],
             parts=[types.Part(text=turn["text"])]
         ))
+    
+    # Add current message
     contents.append(types.Content(
         role="user",
         parts=[types.Part(text=message)]
@@ -727,28 +848,51 @@ def _call_gemini(phone: str, message: str, session: dict) -> str:
             "📞 Mandya Agriculture: *08232-222-666*"
         )
 
-    history.append({"role": "user",  "text": message})
+    history.append({"role": "user", "text": message})
     history.append({"role": "model", "text": reply})
     update_session(phone, {"gemini_history": history, "current_flow": None})
     return reply
 
 
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
 # HELPERS
-# ─────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════
 
 def _detect_scheme_from_msg(message: str) -> str:
+    """Detect scheme ID from message text."""
     msg = message.lower()
-    if "pm kisan" in msg or "pmkisan" in msg or "6000" in msg or "kisan samman" in msg:
-        return "pm_kisan"
-    if "pmfby" in msg or "fasal bima" in msg or "crop insurance" in msg or "ಬೆಳೆ ವಿಮೆ" in message:
-        return "pmfby"
-    if "kcc" in msg or "kisan credit" in msg:
-        return "kcc"
-    if "raita siri" in msg or "ರೈತ ಸಿರಿ" in message or "raitha siri" in msg:
+    
+    scheme_map = {
+        "pm kisan": "pm_kisan",
+        "pmkisan": "pm_kisan",
+        "pm-kisan": "pm_kisan",
+        "kisan samman": "pm_kisan",
+        "6000": "pm_kisan",
+        "pmfby": "pmfby",
+        "fasal bima": "pmfby",
+        "crop insurance": "pmfby",
+        "kcc": "kcc",
+        "kisan credit": "kcc",
+        "raita siri": "karnataka_raita_siri",
+        "raitha siri": "karnataka_raita_siri",
+        "soil health": "soil_health_card",
+        "soil card": "soil_health_card",
+        "drip": "drip_sprinkler",
+        "sprinkler": "drip_sprinkler",
+    }
+    
+    for keyword, scheme_id in scheme_map.items():
+        if keyword in msg or keyword in message.lower():
+            return scheme_id
+    
+    # Check Kannada keywords
+    if "ರೈತ ಸಿರಿ" in message:
         return "karnataka_raita_siri"
-    if "soil health" in msg or "soil card" in msg or "ಮಣ್ಣು ಆರೋಗ್ಯ" in message:
+    if "ಬೆಳೆ ವಿಮೆ" in message:
+        return "pmfby"
+    if "ಮಣ್ಣು ಆರೋಗ್ಯ" in message:
         return "soil_health_card"
-    if "drip" in msg or "sprinkler" in msg or "ಹನಿ ನೀರಾವರಿ" in message:
+    if "ಹನಿ ನೀರಾವರಿ" in message:
         return "drip_sprinkler"
+    
     return None
